@@ -1,377 +1,240 @@
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-import sklearn
-from sklearn.impute import SimpleImputer
-from sklearn import ensemble
-
-import os, sys
-from os import path
-import zipfile
-import urllib.request
-from os import listdir
-from os.path import isfile, join
-
+import numpy as np 
 import torch
-import torchvision
-import torch.optim as optim
 import torch.nn as nn
-import torch.nn.init as init
-
-from tqdm import tqdm, trange
-from models import *
+import torch.optim as optim
+from collections import OrderedDict
 from wscClass import *
-##############################################################
+##############################
 fileNames = {
-    "housing": "housing.data",
     "concrete": "Concrete_Data.csv",
     "energy": "ENB2012_data.xlsx",
     "facebook_1":"Features_Variant_1.csv", 
     "CASP": "CASP.csv", 
-    "blog": "blogData_train", 
-    "community": "community.data", 
+    "community": "communities_attributes.csv", 
     "bike": "bike_train.csv",
     
     "synth-cos": "nofile",
-    "synth-squared": "nofile",
     "synth-inverse": "nofile",
-    "synth-linear": "nofile"
+    "synth-linear": "nofile",
+    "synth-squared": "nofile",
 }
+datasynth = [
+        'synth-cos', 
+        'synth-inverse',
+        'synth-linear', 
+        'synth-squared', 
+        ]
+datareal = [
+        'bike', 
+        'CASP', 
+        'community', 
+        'concrete',
+        'energy', 
+        'facebook_1', 
+        ]
+##################
+# Localizer
+def build_relu(in_dim, hidden_dim = 100, num_layers = 5):
+    v = [nn.Linear(in_dim, hidden_dim), nn.ReLU()]
+    for n in range(num_layers):
+        v.append(nn.Linear(hidden_dim, hidden_dim))
+        v.append(nn.ReLU())
+    v.append(nn.Linear(hidden_dim, 1))
+    v = OrderedDict([(str(i), v[i]) for i in range(len(v))])
+    v = nn.Sequential(v)
+    return v
 
-#data
-def generateInput(N = 1000, d = 3):
-    x = -1 + 2 * np.random.rand(N, 1) * 2
-    X = []
-    for i in range(d):
-        q = np.power(x, i)
-        X.append(q)
-    return np.concatenate(tuple(X), axis=1), x
-
-def generateOutput(X, err):
-    w = np.random.randn(len(X[0]), 1)
-    return X @ w + err * np.random.randn(len(X), 1)
-
-def getDataset(name):
-    base_path='datasets/'
-    file_name = base_path + fileNames[name]
+class localizer(nn.Module):
     
-    if name == 'synth-cos':
-        X, x = generateInput()
-        err = .1 + 2 * np.cos(3.14/2 * abs(x)) * (abs(x)<.5)
-        y = generateOutput(X, err)
-
-    if name == 'synth-squared':
-        X, x = generateInput()
-        err = .1 + 2 * x * x * (abs(x) >.5) 
-        y = generateOutput(X, err)
+    def __init__(self, dim):   
+        super(localizer, self).__init__()
+        self.add_module('reluNet', build_relu(dim))
     
-    if name == 'synth-inverse':
-        X, x = generateInput()
-        err = .1 + 2/ (.1 + abs(x)) * (abs(x) < .5) 
-        y = generateOutput(X, err)
+    def forward(self, x):
+        return abs(self.reluNet(x).squeeze())
+
+###################################
+# NF models
+gamma = .001
+class baseline(nn.Module):
+    def __init__(self, dim):   
+        super(baseline, self).__init__()
+        self.eta = 0
+
+    def forward(self, a, x):
+        return a
     
-    if name == 'synth-linear':
-        X, x = generateInput()
-        err = (.1  + 2 * abs(x) * (abs(x) > .5)) 
-        y = generateOutput(X, err)
-   
-    if name == "concrete":
-        data = pd.read_csv(file_name, header=0).values
-        data = np.array(data).astype(np.float32)
-        X, y = data[:, :-1], data[:, -1]
+    def inverse(self, b, x):
+        return b
     
-    if name == "energy":
-        data = pd.read_excel(file_name, header=0, engine="openpyxl").values
-        data = np.array(data).astype(np.float32)
-        X, y = data[:, :-1], data[:, -1]
+    def loss(self, a, x):
+        return 0
+
+class ER(nn.Module):
+    def __init__(self, dim, eps = gamma):   
+        super(ER, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.eta = 1e-2
+        self.add_module('localizer', localizer(dim))
     
-    if name=="homes":
-        df = pd.read_csv(file_name)
-        y = np.array(df['price']).astype(np.float32)
-        X = np.matrix(df.drop(['id', 'date', 'price'],axis=1)).astype(np.float32)        
-  
-    if name=="facebook_1":
-        df = pd.read_csv(file_name)        
-        y = df.iloc[:,53].values
-        X = df.iloc[:,0:53].values
+    def forward(self, a, x):
+        w = self.localizer(x)
+        return a/(self.eps + w)
     
-    if name=="CASP":
-        df = pd.read_csv(file_name)        
-        y = df.iloc[:,0].values
-        X = df.iloc[:,1:].values        
-  
-    if name=='blog':
-        df = pd.read_csv(base_path + 'blogData_train.csv', header=None)
-        X = df.iloc[:,0:280].values
-        y = df.iloc[:,-1].values
-
-    if name=="bike":
-        df=pd.read_csv(base_path + 'bike_train.csv')
-        season=pd.get_dummies(df['season'],prefix='season')
-        df=pd.concat([df,season],axis=1)
-        weather=pd.get_dummies(df['weather'],prefix='weather')
-        df=pd.concat([df,weather],axis=1)
-        df.drop(['season','weather'],inplace=True,axis=1)
-        df.head()
-        df["hour"] = [t.hour for t in pd.DatetimeIndex(df.datetime)]
-        df["day"] = [t.dayofweek for t in pd.DatetimeIndex(df.datetime)]
-        df["month"] = [t.month for t in pd.DatetimeIndex(df.datetime)]
-        df['year'] = [t.year for t in pd.DatetimeIndex(df.datetime)]
-        df['year'] = df['year'].map({2011:0, 2012:1})
-        df.drop('datetime',axis=1,inplace=True)
-        df.drop(['casual','registered'],axis=1,inplace=True)
-        df.columns.to_series().groupby(df.dtypes).groups
-        X = df.drop('count',axis=1).values
-        y = df['count'].values
+    def inverse(self, b, x):
+        w = self.localizer(x)
+        return b * (self.eps + w)
     
-    if name=="community":
-        attrib = pd.read_csv(base_path + 'communities_attributes.csv', delim_whitespace = True)
-        data = pd.read_csv(base_path + 'communities.data', names = attrib['attributes'])
-        data = data.drop(columns=['state', 'county', 'community', 'communityname', 'fold'], axis=1)
-        data = data.replace('?', np.nan)
-        imputer = sklearn.impute.SimpleImputer(missing_values = np.nan, strategy = 'mean')
-        imputer = imputer.fit(data[['OtherPerCap']])
-        data[['OtherPerCap']] = imputer.transform(data[['OtherPerCap']])
-        data = data.dropna(axis=1)
-        X = data.iloc[:, 0:100].values
-        y = data.iloc[:, 100].values
-    return X, y
+    def loss(self, a, x):
+        w = self.localizer(x)
+        return torch.mean(torch.pow(a - w, 2))
 
-###############################
-#sklearn functions
-def sklearnSplitter(X, y, seed):
-    test_size, proper_size = 0.2, 0.5
-    X_1, X_test, y_1, y_test = sklearn.model_selection.train_test_split(
-            X, y, test_size=test_size, random_state=seed)
-    return (X_1, y_1), (X_test, y_test)
-
-def getAndSplit(name, seed):
-    X, y = getDataset(name)
-    allSets = sklearnSplitter(X, y, seed)
-    return allSets
-
-def sklearnScaler(allSets):
-    idxTrain = 0 
-    scalerX = sklearn.preprocessing.StandardScaler()
-    scalerX = scalerX.fit(allSets[idxTrain][0])
-    mean_ytrain = np.mean(np.abs(allSets[idxTrain][1]))
-    XYsets = []
-    for iData in range(len(allSets)): 
-        X, y = allSets[iData]
-        X, y = np.asarray(X), np.asarray(y)
-        X = scalerX.transform(X)
-        y = np.squeeze(y)/mean_ytrain
-        Z = torch.from_numpy(X).float(), torch.from_numpy(y).float().unsqueeze(1)
-        XYsets.append(torch.utils.data.TensorDataset(Z[0], Z[1]))
-    return XYsets
-
-#create loaders
-def getLoaders(XYsets, batch_size = 16):
-    XYloaders =[]
-    for iData in range(len(XYsets)): 
-        dataset = XYsets[iData]
-        XYloaders.append(
-                torch.utils.data.DataLoader(
-                    dataset, batch_size=batch_size, drop_last=True))
-    return XYloaders
-
-#get model list
-def getModelList(modes):
-    models = []
-    for iMode in range(len(modes)):
-        mode = modes[iMode]
-        models.append(mode)
-    return models
-
-def createValidation(loader, ratio = .2, maxVal = 100, random = 1):
-    X = torch.cat(tuple([z[0] for z in loader]), dim=0)
-    Y = torch.cat(tuple([z[1] for z in loader]), dim=0)
-    cut = min([100, int(len(X) * ratio)])
-    idx = torch.randperm(len(X))
-    X, y = [X[idx[:cut]], X[idx[cut:]]], [Y[idx[:cut]], Y[idx[cut:]]]
-    sets = [torch.utils.data.TensorDataset(X[i], y[i]) 
-            for i in [0, 1]]
-    loaders = [
-            torch.utils.data.DataLoader(s, batch_size=loader.batch_size, 
-                drop_last=True) for s in sets]
-    return loaders
-
-##########################################
-######################################################
-#############################################################
-#optimization
-def trainer(mode, loader, netPars, lr = 1e-3):
-    print('training flow:' + mode)
-    loaderVal, loaderTrain = createValidation(loader)
-    x, y = next(iter(loaderVal))
-    input_dim = x.shape[1]
-    num_epochs, h_dim, n_layers = netPars
-    print("input_dim, batch_size, n_batches", input_dim, x.shape[0], len(loaderTrain))
+class ML(nn.Module):
+    def __init__(self, dim, eps = gamma):   
+        super(ML, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.eta = 1e-4
+        self.add_module('localizer', localizer(dim))
     
-    model = flowModel(mode, input_dim, h_dim, n_layers)
-
-    if mode == 'fixed': 
-        return model
+    def forward(self, a, x):
+        w = self.localizer(x)
+        return torch.log(a/(self.eps + w))
     
-    opt = optim.Adam(model.parameters(), lr)
-    modelPars = mode, input_dim, h_dim, n_layers
-    obj = []
-    iEpoch = 0
-    old = 100000
-    r = 100
-    t = 5
-    while iEpoch < num_epochs:
-        model = trainModel(model, loaderTrain, opt)
-        inputs = torch.cat(tuple([z[0] for z in loaderVal]), dim=0)
-        score = model.flow.loss(inputs)
-        if torch.isnan(score) == False: 
-            obj.append(score.item())
-        else: print('problem')
-        iEpoch = iEpoch + 1
-        if iEpoch%(t+1)==0: 
-            av =sum(obj[-t:])/t 
-            print(iEpoch, 'av', av)    
-        if iEpoch > t:
-            av =sum(obj[-t:])/t 
-            if av >= old: 
-                print(iEpoch,'--> av=',av) 
-                iEpoch = num_epochs
-            else: old = av
-    bestEpochs = np.argmin(obj)
-    print("retraining with best pars ...", bestEpochs)
-    epochs = range(bestEpochs)
-    for iEpoch in epochs:
-        model = trainModel(model, loader, opt)
-    return model
+    def inverse(self, b, x):
+        w = self.localizer(x)
+        return torch.exp(b) * (self.eps + w)
     
-def trainModel(model, loader, opt):
-    model.train()
-    dataloader = loader
-    for inputs, y in dataloader:
-        opt.zero_grad()
-        s = model.flow.loss(inputs)
-        s.backward()
-        opt.step()
-    del dataloader
-    return model
+    def loss(self, a, x):
+        b = self.forward(a, x)
+        return torch.mean(b**2)
 
-#############################################################
-# random forest
-def randomForest(train):
-    Xtrain, ytrain = train
-    forest = sklearn.ensemble.RandomForestRegressor()
-    f = forest.fit(Xtrain, np.ravel(ytrain))
-    return f
-
-#######################################
-#cp
-def conformity(f, y):
-    a = abs(f - y)
-    return a
-
-def getRXDatasets(XYloaders):
-    RXdatasets = []
-    RXloaders = []
-    trainIdx = 0
-    Xtrain, ytrain = [torch.cat(
-            tuple([z[i].detach() for z in XYloaders[trainIdx]]), dim=0)
-            for i in [0, 1]]
-    train = Xtrain, ytrain
-    forest = randomForest(train)
-
-    for iloader in range(len(XYloaders)):
-        loader = XYloaders[iloader]
-        dataset = [torch.cat(
-            tuple([z[i].detach() for z in loader]), dim=0)
-            for i in [0, 1]]
-        Xtest, ytest = dataset
-        f = forest.predict(Xtest)
-        f = torch.tensor(f).unsqueeze(1).float()
-        scores = conformity(f, dataset[1])
-        MSE = torch.mean(torch.pow(f-dataset[1], 2))
-        print('MSE regressor:', MSE )
-        RX = torch.cat((scores, dataset[0]), dim=1)
-        RY = torch.cat((f, dataset[1]), dim=1)
-        RXdatasets.append(torch.utils.data.TensorDataset(RX, RY))
-        RXloaders.append(torch.utils.data.DataLoader(RXdatasets[-1], 
-            batch_size=loader.batch_size))
-    print(len(RXloaders[0]), len(RXloaders[1]))
-    return RXloaders, MSE 
-
-###############################
-#cp evaluation
-def flowEvaluator(flow, loader, testSize):
-    flow.eval()
-    B = torch.cat(tuple([flow(z[0]).detach() for z in loader]), dim=0)[:testSize, :1]
-    AX = torch.cat(tuple([z[0].detach() for z in loader]), dim=0)[:testSize]
-    A, X = AX[:, :1], AX[:, 1:]
-    AFY = torch.cat(tuple([z[1] for z in loader]), dim=0)[:testSize]
-    F, Y = AFY[:, :1], AFY[:, 1:]
+class  Uniform(nn.Module):
+    def __init__(self, dim, eps = gamma):   
+        super(Uniform, self).__init__()
+        self.dim = dim
+        self.eps = eps
+        self.eta = 1e-5
+        self.add_module('localizer', localizer(dim))
     
-    details = []
-    idx = torch.randperm(len(B))
-    calIdx, testIdx = idx[:int(len(B)/2)], idx[int(len(B)/2):]
-    bcal = B[calIdx, :1]
-    y, f, x = Y[testIdx], F[testIdx], X[testIdx]
-    tryAlpha = [0.05, 0.1, 0.32]
-    for alpha in tryAlpha:
-        print("alpha", alpha)
-        n = np.ceil((1 - alpha) * (len(bcal) + 1))
-        nq = int(n) - 1
-        q = torch.sort(bcal.squeeze(), axis=0)[0][nq] * torch.ones([len(y), 1])
-        gap = flow.inverse(torch.cat((q, x), dim=1))[:, :1]
-        good = torch.sum(1*(abs(y-f)<=gap))/len(y)
-        err = (abs(f-y)).squeeze()
-        gap = gap.squeeze()
-        corr = torch.dot(err, gap)/torch.sqrt(
-                torch.dot(err, err) * torch.dot(gap, gap))
-        print('wsc...')
-        wscScore = wsc_unbiased(x.detach().numpy(), err.detach().numpy(), gap.detach().numpy())
-        detail = [good.item(), torch.mean(gap).item(), corr.item(), wscScore]
-        details.append(detail)
-    return details
+    def sigma(self, t):
+        return 1/(1 + torch.exp(-t))
 
+    def logit(self, t):
+        reg = 1e-6
+        return torch.log(t/(1 - t) + reg)
 
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-#visualize results
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-### ### ### ### ### ### ### ### ### ### ### ### ### ### ###
-#print results on the terminal
-def printResults(name, modelNames):
+    def forward(self, a, x):
+        w = self.localizer(x)
+        return self.sigma(a/(self.eps + w))
     
-    fileName = "results/" +  name + ".scores.all.npy"
-    scores = np.load(fileName)
+    def inverse(self, b, x):
+        w = self.localizer(x)
+        return self.logit(b) * (self.eps + w)
+    
+    def loss(self, a, x):
+        reg = 1e-6
+        w = self.localizer(x)
+        b = self.forward(a, x)
+        return - torch.mean(torch.log(reg + b * (1 - b)/(self.eps + w)))
 
-    ialpha = 0
-    means = []
-    for details in scores:
-        m = []
-        for imodel in range(len(details)):
-            val, size, corr, wscScore = details[imodel][ialpha]
-            #print(wscScore)
-            m.append([np.mean(s) for s in [val, size, corr, wscScore]]) 
-        means.append(m)
-    means = np.array(means)
-    names = modelNames
+class wrapper(nn.Module):
+    def __init__(self, dim, name):
+        super(wrapper, self).__init__()
+        self.add_module('score', name(dim))
+    
+    def forward(self, a, x):
+        return self.score(a, x)
+    
+    def inverse(self, b, x):
+        return self.score.inverse(b, x)
 
-    #print averages and standard deviations
-    print("---------------------------------\n",
-            name,
-            "\n---------------------------------")
-    m = np.round(np.mean(means, axis=0), 3)
-    std = np.round(np.std(means, axis=0), 3)
-    for imodel in range(len(names)):
-        modelName = names[imodel]
-        val = str(m[imodel][0]) +'('+str(std[imodel][0])+')' 
-        size = str(m[imodel][1]) +'('+str(std[imodel][1])+')'
-        corr = str(m[imodel][2]) +'('+str(std[imodel][2])+')' 
-        wsc = str(m[imodel][3]) +'('+str(std[imodel][3])+')' 
-        print(modelName)
-        print("average size:", size)
-        print("average error-gap corr:", corr)
-        print("average validity:", val)
-        print("conditional validity:", wsc,"\n")
+    def loss(self, a, x):
+        return self.score.loss(a, x)
 
-    return 0
+nameStrings = ['baseline', 'ER', 'ML', 'Uniform']
+names = [baseline, ER, ML, Uniform] 
+#############################
+# CP functions
+def computeQuantiles(z, tryAlpha): 
+    z = torch.sort(z, dim = 0).values
+    q = [z[int(np.ceil((z.shape[0] + 1) * (1 - alpha))) - 1] for alpha in tryAlpha]
+    return q
+
+def evaluation(model, a, X, Y):
+    model.eval()
+    b = model(a, X)
+    ical, itest = torch.arange(0, int(len(a)/2)), torch.arange(int(len(a)/2), len(a))
+    tryAlpha = [0.05, 0.1, 0.35]
+    q = computeQuantiles(b[ical], tryAlpha)
+    s = []
+    for iq in range(len(tryAlpha)):
+        Q = q[iq]
+        x = X[itest]
+        sets = torch.tensor([model.inverse(Q, z) for z in x]) 
+        y = Y[itest]
+        condcov = wsc_unbiased(x, a[itest], sets)
+        size = torch.mean(sets).item()
+        val = torch.mean(1. * (a[itest] <= sets)).item()
+        print(tryAlpha[iq],':', val, size, condcov)
+        s.append([val, size, condcov])
+    return s
+    
+#############################
+# Optimization function
+
+def initialize(p1, eta):
+    k, dim = p1
+    nameString = nameStrings[k]
+    name = names[k]
+    model = wrapper(dim, name)
+    model.score.eta = min([eta, model.score.eta])
+    print(nameString)
+    if name not in [baseline]:
+        optimizer = optim.Adam(model.parameters(), model.score.eta)
+    else: optimizer = None
+    return model, optimizer, nameString
+
+def optimize(k, data, T, nval):
+    aAll, xAll = data
+    dim = xAll.shape[1]
+    train = torch.randperm(len(aAll)) 
+    N = len(aAll)
+    batch = int(N/5)
+    if nval:
+        train = torch.arange(len(aAll))[:-batch] 
+        val = torch.arange(len(aAll))[-batch:]
+    p1 = k, xAll.shape[1]
+    model, optimizer, nameString = initialize(p1, 1000)
+    if optimizer == None: return model, [0]
+    obj, mobj = [], []
+    t, s, c, old = 0, 0, 0, 1000
+    while s == 0:
+        choice = torch.randperm(len(train))
+        a, x = aAll[choice[:batch]], xAll[choice[:batch], :]  
+        optimizer.zero_grad()
+        loss = model.loss(a, x)
+        if torch.isnan(loss) or loss.item() > 10:
+            print('training nan: restarting eta=', model.score.eta)
+            t, s, c = 0, 0, c + 1
+            p1 = k, xAll.shape[1]
+            model, optimizer, nameString = initialize(p1, model.score.eta/10)
+            loss = model.loss(a, x)
+            if c > 10: return model, mobj
+            else: obj, mobj = [], [] 
+        loss.backward()
+        optimizer.step()
+        if nval:
+            av, xv = aAll[val], xAll[val, :]
+            loss = model.loss(av, xv)
+            if loss.item() > 10:
+                model, optimizer, nameString = initialize(p1, model.score.eta/10)
+            obj.append(loss.item())
+            mobj.append(sum(obj)/(len(obj)))
+            if t%100 == 0: print(t, mobj[-1])
+        t = t + 1
+        if t > T: s = 1
+    return model, obj
+
 

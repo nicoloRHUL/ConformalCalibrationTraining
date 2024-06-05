@@ -1,16 +1,16 @@
+############################
+# The code below is a slightly adapted version of https://github.com/msesia/arc/commit/773b11bd01d22d937fdadaed6671ad5c193b6d03
+#################################
 import numpy as np
 from sklearn.model_selection import train_test_split
-from tqdm import tqdm
 
 def wsc(X, y, S, delta=0.1, M=1000, random_state=2020, verbose=False):
     rng = np.random.default_rng(random_state)
 
     def wsc_v(X, y, S, delta, v):
         n = len(y)
-        #cover = np.array([y[i] in S[i] for i in range(n)])
         cover = np.array([y[i] < S[i] for i in range(n)])
         z = np.dot(X,v)
-        # Compute mass
         z_order = np.argsort(z)
         z_sorted = z[z_order]
         cover_ordered = cover[z_order]
@@ -54,11 +54,9 @@ def wsc(X, y, S, delta=0.1, M=1000, random_state=2020, verbose=False):
     return wsc_star, v_star, a_star, b_star
 
 
-
 def wsc_unbiased(X, y, S, delta=0.1, M=1000, test_size=0.75, random_state=2020, verbose=False):
     def wsc_vab(X, y, S, v, a, b):
         n = len(y)
-        #cover = np.array([y[i] in S[i] for i in range(n)])
         cover = np.array([y[i] < S[i] for i in range(n)])
         z = np.dot(X,v)
         idx = np.where((z>=a)*(z<=b))
@@ -68,8 +66,10 @@ def wsc_unbiased(X, y, S, delta=0.1, M=1000, test_size=0.75, random_state=2020, 
         coverage = np.mean(cover[idx])
         return coverage
     coverage = 0
-    while coverage == 0:
+    t = 0
+    while coverage == 0 and t < 5:
         random_state=random_state + 1
+        t= t+ 1
         X_train, X_test, y_train, y_test, S_train, S_test = train_test_split(X, y, S, test_size=test_size,
                                                                          random_state=random_state)
         # Find adversarial parameters
