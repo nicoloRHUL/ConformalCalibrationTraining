@@ -1,0 +1,3 @@
+After running "trainRFregression.py", this folder contains the AXY files (one per dataset).
+A = |f(X)-Y| is the base conformity score and f(X) the output of the trained RF point-prediction model.
+The files are used in "allExp.py" to train the NF calibration models. 
